@@ -193,6 +193,7 @@ class DeseqDataSet(ad.AnnData):
         n_cpus: Optional[int] = None,
         inference: Optional[Inference] = None,
         quiet: bool = False,
+        delete_intermediate_calulations: bool = False
     ) -> None:
         # Initialize the AnnData part
         if adata is not None:
@@ -281,6 +282,7 @@ class DeseqDataSet(ad.AnnData):
         self.min_replicates = min_replicates
         self.beta_tol = beta_tol
         self.quiet = quiet
+        self.delete_intermediate_calulations = delete_intermediate_calulations
         self.logmeans = None
         self.filtered_genes = None
 
@@ -807,6 +809,9 @@ class DeseqDataSet(ad.AnnData):
         )
         end = time.time()
 
+        if self.delete_intermediate_calulations:
+            del self.layers["_mu_hat"]
+
         if not self.quiet:
             print(f"... done in {end-start:.2f} seconds.\n", file=sys.stderr)
 
@@ -925,6 +930,16 @@ class DeseqDataSet(ad.AnnData):
         self.layers["cooks"] = np.full((self.n_obs, self.n_vars), np.nan)
         self.layers["cooks"][:, self.varm["non_zero"]] = squared_pearson_res
 
+        self._cooks_filtering()
+
+        if self.delete_intermediate_calulations:
+            del self.obsm["_hat_diagonals"]
+            del self.obsm["_mu_LFC"]
+
+            if not self.refit_cooks:
+                del self.layers["cooks"]
+                del self.layers["normed_counts"]
+
         if not self.quiet:
             print(f"... done in {time.time()-start:.2f} seconds.\n", file=sys.stderr)
 
@@ -945,12 +960,60 @@ class DeseqDataSet(ad.AnnData):
         if sum(self.varm["replaced"]) > 0:
             # Refit dispersions and LFCs for genes that had outliers replaced
             self._refit_without_outliers()
+            self._cooks_filtering(on_replaced=True)
         else:
             # Store the fact that no sample was refitted
             self.varm["refitted"] = np.full(
                 self.n_vars,
                 False,
             )
+
+        if self.delete_intermediate_calulations:
+            del self.layers["cooks"]
+            del self.layers["normed_counts"]
+
+            try:
+                del self.layers["replace_cooks"]
+            except KeyError:
+                pass
+
+    def _cooks_filtering(self, on_replaced=False) -> None:
+        """Filter p-values based on Cooks outliers."""
+
+        num_samples = self.n_obs
+        num_vars = self.obsm["design_matrix"].shape[-1]
+        cooks_cutoff = f.ppf(0.99, num_vars, num_samples - num_vars)
+
+        # As in DESeq2, only take samples with 3 or more replicates when looking for
+        # max cooks.
+        use_for_max = n_or_more_replicates(self.obsm["design_matrix"], 3)
+
+        # If for a gene there are 3 samples or more that have more counts than the
+        # maximum cooks sample, don't count this gene as an outlier.
+
+        # Take into account whether we already replaced outliers
+        if on_replaced and self.varm["refitted"].sum() > 0:
+            cooks_outlier = (
+                (self.layers["replace_cooks"][use_for_max, :] > cooks_cutoff)
+                .any(axis=0)
+                .copy()
+            )
+
+        else:
+            cooks_outlier = (
+                (self.layers["cooks"][use_for_max, :] > cooks_cutoff)
+                .any(axis=0)
+                .copy()
+            )
+
+        pos = self.layers["cooks"][:, cooks_outlier].argmax(0)
+
+        cooks_outlier[cooks_outlier] = (
+            self[:, cooks_outlier].X
+            > self[:, cooks_outlier].X[pos, np.arange(len(pos))]
+        ).sum(0) < 3
+
+        self.varm['cooks_outlier'] = cooks_outlier
 
     def _fit_MoM_dispersions(self) -> None:
         """Rough method of moments initial dispersions fit.
@@ -1200,11 +1263,7 @@ class DeseqDataSet(ad.AnnData):
             raise ValueError
 
         sub_dds = DeseqDataSet(
-            counts=pd.DataFrame(
-                self.counts_to_refit.X,
-                index=self.counts_to_refit.obs_names,
-                columns=self.counts_to_refit.var_names,
-            ),
+            counts=self.counts_to_refit.X,
             metadata=self.obs,
             design_factors=self.design_factors,
             continuous_factors=self.continuous_factors,
@@ -1217,6 +1276,7 @@ class DeseqDataSet(ad.AnnData):
             beta_tol=self.beta_tol,
             inference=self.inference,
         )
+        sub_dds.var_names = self.counts_to_refit.var_names
 
         # Use the same size factors
         sub_dds.obsm["size_factors"] = self.counts_to_refit.obsm["size_factors"]
@@ -1261,10 +1321,13 @@ class DeseqDataSet(ad.AnnData):
         ]
         self.varm["dispersions"][self.varm["refitted"]] = sub_dds.varm["dispersions"]
 
-        replace_cooks = pd.DataFrame(self.layers["cooks"].copy())
-        replace_cooks.loc[self.obsm["replaceable"], self.varm["refitted"]] = 0.0
+        self.layers["replace_cooks"] = self.layers["cooks"].copy()
+        _replace_cooks = self.layers["replace_cooks"][self.obsm["replaceable"]]
+        _replace_cooks[:, self.varm["refitted"]] = 0.0
+        self.layers["replace_cooks"][self.obsm["replaceable"]] = _replace_cooks
 
-        self.layers["replace_cooks"] = replace_cooks
+        if self.delete_intermediate_calulations:
+            del self.counts_to_refit
 
     def _fit_iterate_size_factors(self, niter: int = 10, quant: float = 0.95) -> None:
         """

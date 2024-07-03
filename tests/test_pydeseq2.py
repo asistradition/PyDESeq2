@@ -259,6 +259,38 @@ def test_deseq_no_refit_cooks(counts_df, metadata, tol=0.02):
 
     # Check results
     assert_res_almost_equal(res_df, r_res, tol)
+    assert len(dds.layers) == 3
+
+
+def test_deseq_no_refit_cooks_cleanup(counts_df, metadata, tol=0.02):
+    """Test that the outputs of the DESeq2 function *without cooks refit*
+    match those of the original R package, up to a tolerance in relative error.
+    Note: this is just to check that the workflow runs bug-free, as we expect no outliers
+    in the synthetic dataset.
+    """
+
+    test_path = str(Path(os.path.realpath(tests.__file__)).parent.resolve())
+
+    r_res = pd.read_csv(
+        os.path.join(test_path, "data/single_factor/r_test_res.csv"), index_col=0
+    )
+
+    dds = DeseqDataSet(
+        counts=counts_df,
+        metadata=metadata,
+        design_factors="condition",
+        refit_cooks=False,
+        delete_intermediate_calulations=True
+    )
+    dds.deseq2()
+
+    res = DeseqStats(dds)
+    res.summary()
+    res_df = res.results_df
+
+    # Check results
+    assert_res_almost_equal(res_df, r_res, tol)
+    assert len(dds.layers) == 0
 
 
 def test_lfc_shrinkage(counts_df, metadata, tol=0.02):
